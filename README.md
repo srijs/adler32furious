@@ -1,7 +1,15 @@
 # adler32furious
 
+[![crates.io](https://img.shields.io/crates/v/adler32furious.svg)](https://crates.io/crates/adler32furious)
+[![docs.rs](https://img.shields.io/docsrs/adler32furious)](https://docs.rs/adler32furious)
+[![CI](https://github.com/srijs/adler32furious/actions/workflows/ci.yml/badge.svg)](https://github.com/srijs/adler32furious/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/crates/msrv/adler32furious)](Cargo.toml)
+[![License](https://img.shields.io/crates/l/adler32furious.svg)](#license)
+
 Fast [Adler-32](https://datatracker.ietf.org/doc/html/rfc1950#section-9)
-checksums for Rust.
+checksums for Rust. It has SIMD versions for x86 and AArch64, chooses the best
+one for the CPU at runtime, and has a fast portable version for everything
+else.
 
 ```rust
 use adler32furious::{adler32, Adler32};
@@ -14,63 +22,86 @@ a.update(b"pedia");
 assert_eq!(a.checksum(), 0x11E6_0398);
 ```
 
-`Adler32` also supports `combine` (join checksums of adjacent pieces computed
-separately, e.g. in parallel) and implements `Hasher` and `io::Write`.
+`Adler32` also supports `combine`, which joins the checksums of adjacent
+pieces computed separately, for example in parallel. It implements `Hasher`
+and `io::Write`.
+
+## Performance
+
+Throughput in GiB/s on 1 MiB of data:
+
+| CPU | Implementation used | adler32furious | [simd-adler32] | [adler2] |
+| --- | --- | ---: | ---: | ---: |
+| Intel Sapphire Rapids | AVX-512 VNNI, 512-bit | **100.9** | 41.0 | 9.6 |
+| AMD Zen 4 | AVX-512 VNNI, 512-bit | **83.8** | 50.0 | 10.8 |
+| Intel Ice Lake | AVX-512 VNNI, 256-bit | **64.9** | 29.6 | 8.7 |
+| Apple M4 | NEON with dot product | **60.5** | 40.7 | 5.9 |
+| AMD Zen 3 | AVX2 | **51.0** | 45.7 | 10.0 |
+
+On these CPUs that is 1.1× (Zen 3, where both crates use AVX2) to 2.5×
+(Sapphire Rapids) the speed of simd-adler32, and 5–10× the speed of adler2.
+
+By input size, on an Apple M4:
+
+| Crate | 16 B | 64 B | 1 KiB | 16 KiB | 1 MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **adler32furious** | **3.8** | 18.3 | **59.3** | **64.1** | **60.5** |
+| [simd-adler32] | 2.4 | 18.4 | 40.2 | 39.9 | 40.7 |
+| [adler2] | 3.0 | 4.7 | 7.1 | 7.0 | 5.9 |
+
+The lead appears once inputs reach a few hundred bytes. On very short
+inputs, choosing an implementation and handling the leftover bytes takes
+most of the time, and all three are close.
+
+The portable version is used on CPUs without a SIMD version. It processes a
+machine word at a time, treating it as several 16-bit lanes, and runs at
+7–15 GiB/s on these machines. That is well ahead of adler2 up to 16 KiB, and
+about level with it on larger inputs.
+
+The x86 numbers are from AWS `c7i`, `c7a`, `c6i` and `c6a` instances. To
+reproduce, run `cargo bench -p adler32furious-bench`. It also benchmarks each
+implementation the CPU supports on its own.
+
+[simd-adler32]: https://crates.io/crates/simd-adler32
+[adler2]: https://crates.io/crates/adler2
 
 ## Implementations
 
-The fastest one the CPU supports is used:
+The fastest implementation the CPU supports is used:
 
-| Arch | Implementations |
+| Arch | Implementations, fastest first |
 | --- | --- |
 | x86 / x86_64 | AVX-512 VNNI (512- and 256-bit vectors), AVX-VNNI, AVX2, SSE2 |
 | AArch64 (little-endian) | NEON with dot product, NEON |
 | anything else | portable, a machine word at a time |
 
-512-bit vectors are skipped on Intel CPUs that downclock too eagerly with
-them, and AVX-512 is never used on macOS.
+512-bit vectors are not used on Intel CPUs that slow down too much when they
+run them. AVX-512 is never used on macOS.
+
+The cost of choosing is small. std caches its CPU feature detection, so each
+call checks a cached value, and the implementation is called directly when
+the target features enabled at compile time already decide it. One example
+is dot product on Apple targets.
+
+Every implementation is tested against a reference C implementation and
+fuzzed. In CI, every x86 implementation runs under Intel's SDE emulator.
 
 ## Features
 
-- `std` (default): detect CPU features at runtime, with std's cached
-  detection. Without it the crate is `no_std` and picks an implementation
-  at compile time from the enabled target features, so build with e.g.
-  `-C target-cpu=native` (or `-C target-feature=+avx2`) to get past the
-  baseline (SSE2 on x86_64, NEON on AArch64). The one runtime check left is
-  whether AVX-512 should use 512-bit vectors, done once.
+- `std` (enabled by default): detects CPU features at runtime.
 
-Features enabled at compile time (such as dot product on Apple targets) need
-no runtime check, and when all of them are, the implementation is called
-directly. Under Miri, the portable implementation is used, so downstream
-crates can run their tests under Miri.
+  Without `std`, the crate is `no_std` and picks the implementation at
+  compile time, from the enabled target features. By default that is the
+  baseline: SSE2 on x86_64 and NEON on AArch64. To use a faster
+  implementation, build with `-C target-cpu=native` or
+  `-C target-feature=+avx2`. One check is still made at runtime, once:
+  whether AVX-512 should use 512-bit vectors.
 
-Minimum supported Rust version: 1.89.
+Under Miri the portable version is always used, so crates that depend on
+this one can run their tests under Miri.
 
-## Performance
-
-Throughput on an Apple M4 (`cargo bench -p adler32furious-bench`), 1 MiB of
-random data:
-
-| Crate | GiB/s |
-| --- | --- |
-| adler32furious | 65.3 |
-| simd-adler32 | 41.9 |
-| adler2 | 7.2 |
-
-The portable implementation, used where there is no SIMD version, runs at
-16.5 GiB/s here (15.4 GiB/s on x86_64 under Rosetta), about twice `adler2`.
-
-## Testing
-
-```sh
-cargo test                                   # unit tests, plus differential tests against a C implementation
-cargo test --no-default-features             # no_std dispatch
-cargo bench -p adler32furious-bench          # vs other implementations
-cargo +nightly fuzz run adler32
-```
-
-The tests check every implementation the machine supports, not just the one
-that gets picked.
+The minimum supported Rust version is 1.89, which stabilized the AVX-512
+intrinsics.
 
 ## License
 
