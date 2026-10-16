@@ -1,0 +1,23 @@
+[package]
+name = "adler32furious-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+libdeflater = "1.26"
+adler32furious = { path = ".." }
+
+# Keep the fuzz crate out of the main package's build.
+[workspace]
+
+[[bin]]
+name = "adler32"
+path = "fuzz_targets/adler32.rs"
+test = false
+doc = false
+bench = false

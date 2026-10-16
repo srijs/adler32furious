@@ -1,0 +1,280 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, to catch breakage from new toolchains and dependencies.
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }} / ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, rust: stable }
+          - { os: ubuntu-latest, rust: beta }
+          - { os: ubuntu-latest, rust: nightly }
+          - { os: ubuntu-24.04-arm, rust: stable, expect: neon_dotprod }
+          - { os: macos-latest, rust: stable, expect: neon_dotprod }
+          - { os: windows-latest, rust: stable }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+        env:
+          ADLER32FURIOUS_EXPECT: ${{ matrix.expect }}
+      - run: cargo test --release
+        env:
+          ADLER32FURIOUS_EXPECT: ${{ matrix.expect }}
+      - name: no_std
+        run: cargo test --no-default-features
+      - name: no_std with native target features
+        run: cargo test --no-default-features --lib
+        env:
+          RUSTFLAGS: -D warnings -C target-cpu=native
+      - name: Benchmarks compile
+        run: cargo bench -p adler32furious-bench --no-run
+
+  emulated:
+    # Every x86 implementation on a known CPU, under Intel's SDE, checking
+    # that dispatch picks the expected one; and big-endian under QEMU.
+    name: emulated / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Nehalem, sde: nhm, cpu: nehalem, expect: sse2 }
+          - { name: Haswell, sde: hsw, cpu: haswell, expect: avx2 }
+          - { name: Alder Lake, sde: adl, cpu: alderlake, expect: avx2_vnni }
+          # Ice Lake downclocks with 512-bit vectors, so gets 256-bit ones.
+          - { name: Ice Lake server, sde: icx, cpu: icelake-server, expect: avx512_vl256_vnni }
+          - { name: Sapphire Rapids, sde: spr, cpu: sapphirerapids, expect: avx512_vl512_vnni }
+          - { name: s390x big-endian, target: s390x-unknown-linux-gnu, expect: generic }
+    env:
+      TARGET: ${{ matrix.target || 'x86_64-unknown-linux-gnu' }}
+      ADLER32FURIOUS_EXPECT: ${{ matrix.expect }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: Set up SDE
+        if: matrix.sde
+        uses: petarpetrovt/setup-sde@v6.0
+      - name: Run tests under SDE
+        if: matrix.sde
+        run: |
+          sde=$(find "$SDE_PATH" -name sde64 -type f | head -n 1)
+          test -x "$sde"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$sde -${{ matrix.sde }} --" >> "$GITHUB_ENV"
+      - name: Set up QEMU and the cross toolchain
+        if: matrix.target == 's390x-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user gcc-s390x-linux-gnu
+          echo "CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_LINKER=s390x-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_RUNNER=qemu-s390x -L /usr/s390x-linux-gnu" >> "$GITHUB_ENV"
+      # `--target` keeps RUSTFLAGS off build scripts, which run natively.
+      - run: cargo test --release --target "$TARGET"
+      - name: no_std, with the CPU's features enabled at compile time
+        if: matrix.cpu
+        run: cargo test --release --no-default-features --target "$TARGET"
+        env:
+          RUSTFLAGS: -D warnings -C target-cpu=${{ matrix.cpu }}
+
+  test-32bit:
+    # 32-bit x86 SIMD paths, and the portable code with 4-byte words.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - run: cargo test --lib --target i686-unknown-linux-gnu
+      - run: cargo test --lib --target i686-unknown-linux-gnu --no-default-features
+
+  miri:
+    # Checks that downstream crates can test under Miri (which runs the
+    # portable version), and the unsafe code that remains in its path.
+    # macOS arm64 is the case that used to break: dotprod is enabled at
+    # compile time there, and its version uses inline asm.
+    name: miri / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test --lib
+      - run: cargo miri test --lib --no-default-features
+
+  asan:
+    # Miri cannot run the SIMD versions, so AddressSanitizer checks their
+    # loads stay in bounds; see the `reads_stay_in_bounds` test.
+    name: asan / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      # `--target` keeps the sanitizer off build scripts and proc macros.
+      - run: cargo test --lib --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: -D warnings -Z sanitizer=address
+          ASAN_OPTIONS: detect_leaks=0
+
+  checks:
+    name: fmt, clippy, docs, package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path fuzz/Cargo.toml --check
+      - run: cargo clippy --workspace --all-targets
+      - name: Clippy (no_std)
+        run: cargo clippy --no-default-features
+      - name: Docs
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo check --manifest-path fuzz/Cargo.toml
+      - run: cargo package
+
+  cross:
+    # Targets CI does not run on. `--lib` builds no dev-dependencies.
+    name: cross-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: >-
+            aarch64-unknown-linux-gnu, i586-unknown-linux-gnu, i686-unknown-linux-gnu,
+            riscv64gc-unknown-linux-gnu, powerpc64-unknown-linux-gnu,
+            wasm32-unknown-unknown, x86_64-fortanix-unknown-sgx,
+            thumbv6m-none-eabi, thumbv7em-none-eabi,
+            aarch64-unknown-none, x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - name: With std
+        run: |
+          for target in aarch64-unknown-linux-gnu i586-unknown-linux-gnu i686-unknown-linux-gnu \
+              riscv64gc-unknown-linux-gnu powerpc64-unknown-linux-gnu \
+              wasm32-unknown-unknown x86_64-fortanix-unknown-sgx; do
+            echo "::group::$target"
+            cargo clippy --lib --target "$target"
+            cargo clippy --lib --target "$target" --no-default-features
+            echo "::endgroup::"
+          done
+      - name: Without std
+        run: |
+          for target in thumbv6m-none-eabi thumbv7em-none-eabi aarch64-unknown-none x86_64-unknown-none; do
+            echo "::group::$target"
+            cargo clippy --lib --target "$target" --no-default-features
+            echo "::endgroup::"
+          done
+      - name: Without std, with AVX-512 (picked at runtime, with cached cpuid)
+        run: cargo clippy --lib --target x86_64-unknown-none --no-default-features
+        env:
+          RUSTFLAGS: -D warnings -C target-feature=+avx512bw,+avx512vl,+avx512vnni
+
+  msrv:
+    # The MSRV covers what is published: the library and its dependencies.
+    # Cargo resolves dev-dependencies (and the bench crate's) before building
+    # anything, so a newer one could fail this job without the library being
+    # at fault. Strip them with the current cargo, then build with the MSRV.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: cargo hack --remove-dev-deps
+      - name: Install the MSRV toolchain
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "adler32furious") | .rust_version')
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal --target aarch64-unknown-linux-gnu --no-self-update
+      - run: cargo "+$MSRV" check --lib
+      - run: cargo "+$MSRV" check --lib --no-default-features
+      - run: cargo "+$MSRV" check --lib --target aarch64-unknown-linux-gnu
+
+  fuzz:
+    name: fuzz / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fuzz run adler32 --target ${{ matrix.target }} -- -max_total_time=60
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  success:
+    # The one check for branch protection to require.
+    name: CI success
+    runs-on: ubuntu-latest
+    needs: [test, emulated, test-32bit, miri, asan, checks, cross, msrv, fuzz]
+    if: always()
+    steps:
+      - name: Check that all jobs succeeded
+        run: |
+          for result in ${{ join(needs.*.result, ' ') }}; do
+            if [ "$result" != "success" ]; then
+              echo "A required job did not succeed: $result"
+              exit 1
+            fi
+          done
