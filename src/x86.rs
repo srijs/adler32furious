@@ -6,7 +6,7 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-use super::scalar::chunk;
+use super::scalar::{self, chunk};
 use super::{Adler32Fn, DIVISOR, MAX_CHUNK_LEN};
 
 /// Implementations usable on this CPU, best first.
@@ -146,15 +146,90 @@ fn reduce128(v_s1: __m128i, v_s2: __m128i, s1_odd_lanes: bool, s1: &mut u32, s2:
 #[inline]
 #[target_feature(enable = "avx2")]
 fn reduce256(v_s1: __m256i, v_s2: __m256i, s1_odd_lanes: bool, s1: &mut u32, s2: &mut u32) {
-    let v_s1 = _mm_add_epi32(
-        _mm256_castsi256_si128(v_s1),
-        _mm256_extracti128_si256::<1>(v_s1),
-    );
-    let v_s2 = _mm_add_epi32(
-        _mm256_castsi256_si128(v_s2),
-        _mm256_extracti128_si256::<1>(v_s2),
-    );
+    let (v_s1, v_s2) = narrow256(v_s1, v_s2);
     reduce128(v_s1, v_s2, s1_odd_lanes, s1, s2);
+}
+
+/// Adds the halves of each of `v_s1` and `v_s2`.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn narrow256(v_s1: __m256i, v_s2: __m256i) -> (__m128i, __m128i) {
+    let half = |v| _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+    (half(v_s1), half(v_s2))
+}
+
+#[inline]
+#[target_feature(enable = "sse2")]
+fn narrow128(v_s1: __m128i, v_s2: __m128i) -> (__m128i, __m128i) {
+    (v_s1, v_s2)
+}
+
+#[inline]
+#[target_feature(enable = "sse2")]
+fn load128(p: &[u8]) -> __m128i {
+    let p: &[u8; 16] = p[..16].try_into().unwrap();
+    // SAFETY: p is 16 bytes.
+    unsafe { _mm_loadu_si128(p.as_ptr().cast()) }
+}
+
+/// A mask for the last `n` of `N` bytes, for a vector loaded so that it ends
+/// with the `n` bytes wanted.
+#[inline(always)]
+fn tail_mask<const N: usize>(n: usize) -> &'static [u8; N] {
+    static MASKS: [u8; 64] = {
+        let mut m = [0u8; 64];
+        let mut i = 32;
+        while i < 64 {
+            m[i] = 0xFF;
+            i += 1;
+        }
+        m
+    };
+    MASKS[32 - N + n..][..N].try_into().unwrap()
+}
+
+/// The bytes of `data`, weighted 16 down to 1, summed into 32-bit lanes.
+#[inline]
+#[target_feature(enable = "sse2")]
+fn weighted128(data: __m128i) -> __m128i {
+    static MULTS: [[u16; 8]; 2] = [[16, 15, 14, 13, 12, 11, 10, 9], [8, 7, 6, 5, 4, 3, 2, 1]];
+    let zeroes = _mm_setzero_si128();
+    let [lo, hi] = MULTS.each_ref().map(|m| {
+        // SAFETY: m is 8 u16s.
+        unsafe { _mm_loadu_si128(m.as_ptr().cast()) }
+    });
+    _mm_add_epi32(
+        _mm_madd_epi16(_mm_unpacklo_epi8(data, zeroes), lo),
+        _mm_madd_epi16(_mm_unpackhi_epi8(data, zeroes), hi),
+    )
+}
+
+/// Adds `c`, the last bytes of `whole`, to `v_s1` and `v_s2` 16 at a time.
+///
+/// `whole` must be at least 16 bytes: the last partial vector is its last 16
+/// bytes, with those before `c` masked off. `v_s1` must have only even lanes
+/// set, as from `psadbw`. The caller adds `s1 * c.len()` to `s2`.
+#[inline]
+#[target_feature(enable = "sse2")]
+fn tail128(whole: &[u8], mut c: &[u8], v_s1: &mut __m128i, v_s2: &mut __m128i) {
+    let zeroes = _mm_setzero_si128();
+    while c.len() >= 16 {
+        let data = load128(c);
+        *v_s2 = _mm_add_epi32(*v_s2, _mm_slli_epi32::<4>(*v_s1));
+        *v_s1 = _mm_add_epi32(*v_s1, _mm_sad_epu8(data, zeroes));
+        *v_s2 = _mm_add_epi32(*v_s2, weighted128(data));
+        c = &c[16..];
+    }
+    if !c.is_empty() {
+        let n = c.len();
+        let last = load128(&whole[whole.len() - 16..]);
+        let data = _mm_and_si128(last, load128(tail_mask::<16>(n)));
+        // With only even lanes set, a 32x32->64-bit multiply of those covers
+        // all of v_s1, and the products fit in 32 bits.
+        *v_s2 = _mm_add_epi32(*v_s2, _mm_mul_epu32(*v_s1, _mm_set1_epi32(n as i32)));
+        *v_s1 = _mm_add_epi32(*v_s1, _mm_sad_epu8(data, zeroes));
+        *v_s2 = _mm_add_epi32(*v_s2, weighted128(data));
+    }
 }
 
 #[inline]
@@ -193,13 +268,16 @@ macro_rules! adler32_legacy {
         $name:ident, $feat:literal, $vl:literal, $mults:expr,
         $loadu:ident, $setzero:ident, $add16:ident, $add32:ident,
         $unpacklo8:ident, $unpackhi8:ident, $sad8:ident, $madd16:ident,
-        $slli32:ident, $log2_2vl:literal, $reduce:ident
+        $slli32:ident, $log2_2vl:literal, $narrow:ident
     ) => {
         #[target_feature(enable = $feat)]
         pub(super) fn $name(adler: u32, data: &[u8]) -> u32 {
             #[repr(align(32))]
             struct Mults([[u16; $vl / 2]; 4]);
             static MULTS: Mults = Mults($mults);
+            if data.len() < 16 {
+                return scalar::adler32_generic(adler, data);
+            }
             let [mults_a, mults_b, mults_c, mults_d] = MULTS.0.each_ref().map(|m| {
                 // SAFETY: MULTS is 4 vectors of plain data.
                 unsafe { $loadu(m.as_ptr().cast()) }
@@ -217,48 +295,57 @@ macro_rules! adler32_legacy {
             while !p.is_empty() {
                 let (mut c, rest) = p.split_at(p.len().min(max));
                 p = rest;
-                if c.len() >= 2 * $vl {
-                    let mut v_s1 = zeroes;
-                    let mut v_s1_sums = zeroes;
-                    let mut v_byte_sums_a = zeroes;
-                    let mut v_byte_sums_b = zeroes;
-                    let mut v_byte_sums_c = zeroes;
-                    let mut v_byte_sums_d = zeroes;
+                if c.len() >= 16 {
+                    let whole = c;
+                    s2 += s1 * c.len() as u32;
+                    let (mut v_s1, mut v_s2) = if c.len() >= 2 * $vl {
+                        let mut v_s1 = zeroes;
+                        let mut v_s1_sums = zeroes;
+                        let mut v_byte_sums_a = zeroes;
+                        let mut v_byte_sums_b = zeroes;
+                        let mut v_byte_sums_c = zeroes;
+                        let mut v_byte_sums_d = zeroes;
 
-                    s2 += s1 * (c.len() & !(2 * $vl - 1)) as u32;
+                        while c.len() >= 2 * $vl {
+                            // SAFETY: c holds at least 2 * VL bytes.
+                            let (data_a, data_b) = unsafe {
+                                (
+                                    $loadu(c.as_ptr().cast()),
+                                    $loadu(c.as_ptr().add($vl).cast()),
+                                )
+                            };
+                            v_s1_sums = $add32(v_s1_sums, v_s1);
+                            v_byte_sums_a = $add16(v_byte_sums_a, $unpacklo8(data_a, zeroes));
+                            v_byte_sums_b = $add16(v_byte_sums_b, $unpackhi8(data_a, zeroes));
+                            v_byte_sums_c = $add16(v_byte_sums_c, $unpacklo8(data_b, zeroes));
+                            v_byte_sums_d = $add16(v_byte_sums_d, $unpackhi8(data_b, zeroes));
+                            v_s1 =
+                                $add32(v_s1, $add32($sad8(data_a, zeroes), $sad8(data_b, zeroes)));
+                            c = &c[2 * $vl..];
+                        }
 
-                    while c.len() >= 2 * $vl {
-                        // SAFETY: c holds at least 2 * VL bytes.
-                        let (data_a, data_b) = unsafe {
-                            (
-                                $loadu(c.as_ptr().cast()),
-                                $loadu(c.as_ptr().add($vl).cast()),
-                            )
-                        };
-                        v_s1_sums = $add32(v_s1_sums, v_s1);
-                        v_byte_sums_a = $add16(v_byte_sums_a, $unpacklo8(data_a, zeroes));
-                        v_byte_sums_b = $add16(v_byte_sums_b, $unpackhi8(data_a, zeroes));
-                        v_byte_sums_c = $add16(v_byte_sums_c, $unpacklo8(data_b, zeroes));
-                        v_byte_sums_d = $add16(v_byte_sums_d, $unpackhi8(data_b, zeroes));
-                        v_s1 = $add32(v_s1, $add32($sad8(data_a, zeroes), $sad8(data_b, zeroes)));
-                        c = &c[2 * $vl..];
-                    }
-
-                    // v_s2 = 2*VL * v_s1_sums + [2*VL, ..., 1] * v_byte_sums
-                    let v_s2 = $add32(
-                        $add32(
-                            $slli32::<$log2_2vl>(v_s1_sums),
-                            $madd16(v_byte_sums_a, mults_a),
-                        ),
-                        $add32(
+                        // v_s2 = 2*VL * v_s1_sums + [2*VL, ..., 1] * v_byte_sums
+                        let v_s2 = $add32(
                             $add32(
-                                $madd16(v_byte_sums_b, mults_b),
-                                $madd16(v_byte_sums_c, mults_c),
+                                $slli32::<$log2_2vl>(v_s1_sums),
+                                $madd16(v_byte_sums_a, mults_a),
                             ),
-                            $madd16(v_byte_sums_d, mults_d),
-                        ),
-                    );
-                    $reduce(v_s1, v_s2, false, &mut s1, &mut s2);
+                            $add32(
+                                $add32(
+                                    $madd16(v_byte_sums_b, mults_b),
+                                    $madd16(v_byte_sums_c, mults_c),
+                                ),
+                                $madd16(v_byte_sums_d, mults_d),
+                            ),
+                        );
+                        $narrow(v_s1, v_s2)
+                    } else {
+                        (_mm_setzero_si128(), _mm_setzero_si128())
+                    };
+                    // The last 0 <= n < 2*VL bytes.
+                    tail128(whole, c, &mut v_s1, &mut v_s2);
+                    c = &[];
+                    reduce128(v_s1, v_s2, false, &mut s1, &mut s2);
                 }
                 chunk(&mut s1, &mut s2, c);
             }
@@ -276,7 +363,8 @@ macro_rules! adler32_vnni {
         $loadu:ident, $setzero:ident, $add8:ident, $add32:ident,
         $dpbusd:ident, $set1_8:ident, $set1_32:ident, $mullo32:ident, $slli32:ident,
         [$log2_vl:literal, $log2_2vl:literal, $log2_4vl:literal],
-        |$tail:ident, $n:ident| $tail_load:expr,
+        $(below $min_len:literal: $fallback:path,)?
+        |$tail:ident, $n:ident, $upto:ident, $mults:ident, $base:ident| $tail_load:expr,
         |$v1:ident, $v2:ident, $r1:ident, $r2:ident| $reduce:expr
     ) => {
         #[target_feature(enable = $feat)]
@@ -292,6 +380,11 @@ macro_rules! adler32_vnni {
                 }
                 m
             });
+            $(
+                if data.len() < $min_len {
+                    return $fallback(adler, data);
+                }
+            )?
             let ones = $set1_8(1);
             let zeroes = $setzero();
             let mut s1 = adler & 0xFFFF;
@@ -395,10 +488,15 @@ macro_rules! adler32_vnni {
                         c = &c[$vl..];
                         mults = $add8(mults, $set1_8(-($vl as i8)));
                     }
-                    // The last 0 < n <= VL bytes.
-                    let data = {
+                    // The last 0 < n <= VL bytes, and their weights.
+                    let (data, mults) = {
                         let $tail = c;
                         let $n = c.len();
+                        // The input up to the end of this chunk.
+                        let $upto = &data[..data.len() - p.len()];
+                        let $mults = mults;
+                        // SAFETY: MULTS is VL bytes.
+                        let $base: $vec = unsafe { $loadu(MULTS.0.as_ptr().cast()) };
                         $tail_load
                     };
                     v_s1 = $dpbusd(v_s1, data, ones);
@@ -415,14 +513,6 @@ macro_rules! adler32_vnni {
             (s2 << 16) | s1
         }
     };
-}
-
-/// Loads the first `c.len() <= N` bytes of `c` into a zero-padded vector.
-#[inline(always)]
-fn load_partial<const N: usize>(c: &[u8]) -> [u8; N] {
-    let mut buf = [0u8; N];
-    buf[..c.len()].copy_from_slice(c);
-    buf
 }
 
 mod sse2_impl {
@@ -447,7 +537,7 @@ mod sse2_impl {
         _mm_madd_epi16,
         _mm_slli_epi32,
         5,
-        reduce128
+        narrow128
     );
 }
 use sse2_impl::sse2;
@@ -476,7 +566,7 @@ mod avx2_impl {
         _mm256_madd_epi16,
         _mm256_slli_epi32,
         6,
-        reduce256
+        narrow256
     );
 }
 use avx2_impl::avx2;
@@ -499,10 +589,21 @@ mod avx2_vnni_impl {
         _mm256_mullo_epi32,
         _mm256_slli_epi32,
         [5, 6, 7],
-        |c, _n| {
-            let buf = load_partial::<32>(c);
-            // SAFETY: buf is 32 bytes.
-            unsafe { _mm256_loadu_si256(buf.as_ptr().cast()) }
+        // Short inputs are faster without VNNI. This also leaves 32 bytes
+        // before the end of every chunk for the last vector.
+        below 32: avx2,
+        // There is no masked load: load the 32 bytes that end with the last
+        // n, and zero the others. Their weights are then the unshifted ones.
+        |_c, n, upto, _mults, base| {
+            let last: &[u8; 32] = upto[upto.len() - 32..].try_into().unwrap();
+            // SAFETY: last and the mask are 32 bytes.
+            let (last, mask) = unsafe {
+                (
+                    _mm256_loadu_si256(last.as_ptr().cast()),
+                    _mm256_loadu_si256(tail_mask::<32>(n).as_ptr().cast()),
+                )
+            };
+            (_mm256_and_si256(last, mask), base)
         },
         |v1, v2, s1, s2| reduce256(v1, v2, true, s1, s2)
     );
@@ -528,8 +629,11 @@ mod avx512_vl256_vnni_impl {
         _mm256_mullo_epi32,
         _mm256_slli_epi32,
         [5, 6, 7],
-        // SAFETY: the masked load reads only the first n bytes.
-        |c, n| unsafe { _mm256_maskz_loadu_epi8(u32::MAX >> (32 - n), c.as_ptr().cast()) },
+        |c, n, _upto, mults, _base| {
+            // SAFETY: the masked load reads only the first n bytes.
+            let data = unsafe { _mm256_maskz_loadu_epi8(u32::MAX >> (32 - n), c.as_ptr().cast()) };
+            (data, mults)
+        },
         |v1, v2, s1, s2| reduce256(v1, v2, true, s1, s2)
     );
 }
@@ -552,8 +656,11 @@ mod avx512_vl512_vnni_impl {
         _mm512_mullo_epi32,
         _mm512_slli_epi32,
         [6, 7, 8],
-        // SAFETY: the masked load reads only the first n bytes.
-        |c, n| unsafe { _mm512_maskz_loadu_epi8(u64::MAX >> (64 - n), c.as_ptr().cast()) },
+        |c, n, _upto, mults, _base| {
+            // SAFETY: the masked load reads only the first n bytes.
+            let data = unsafe { _mm512_maskz_loadu_epi8(u64::MAX >> (64 - n), c.as_ptr().cast()) };
+            (data, mults)
+        },
         |v1, v2, s1, s2| reduce512(v1, v2, s1, s2)
     );
 }

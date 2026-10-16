@@ -50,7 +50,7 @@ const MAX_CHUNK_LEN: usize = 5552;
 /// Unsafe because most are `#[target_feature]` functions: callers must make
 /// sure the CPU supports the features the function was compiled with. The
 /// only source of them is `available`, which lists those the CPU supports;
-/// `select` picks the first.
+/// `best` picks the first, and `select` returns it, cached where that helps.
 type Adler32Fn = unsafe fn(u32, &[u8]) -> u32;
 
 /// Computes the Adler-32 checksum of `data`.
@@ -239,13 +239,46 @@ fn available(push: &mut impl FnMut((&'static str, Adler32Fn))) {
     push(("generic", scalar::adler32_generic));
 }
 
-/// The best implementation for this CPU.
+/// The best implementation for this CPU, cached.
 ///
-/// Cheap enough to call for every update: the checks are compile-time
-/// `cfg!`s, cached std feature detection, or cached (`allow_512bit_vectors`),
-/// and with only compile-time ones it folds to a constant.
+/// On x86 with std, choosing takes several feature checks, which cost a
+/// couple of nanoseconds per call even with std's cache, so the choice is
+/// cached and each call is a single load.
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline]
 fn select() -> Adler32Fn {
+    use core::sync::atomic::{AtomicPtr, Ordering};
+    static BEST: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+    #[cold]
+    fn init() -> Adler32Fn {
+        let f = best();
+        BEST.store(f as *mut (), Ordering::Relaxed);
+        f
+    }
+
+    let f = BEST.load(Ordering::Relaxed);
+    if f.is_null() {
+        init()
+    } else {
+        // SAFETY: `init` only stores `Adler32Fn`s.
+        unsafe { core::mem::transmute::<*mut (), Adler32Fn>(f) }
+    }
+}
+
+/// The best implementation for this CPU.
+///
+/// Cheap enough to call for every update without caching: here the checks
+/// are compile-time `cfg!`s, which fold to a direct call, a single cached std
+/// check, or cached themselves (`allow_512bit_vectors`).
+#[cfg(not(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64"))))]
+#[inline]
+fn select() -> Adler32Fn {
+    best()
+}
+
+#[inline]
+fn best() -> Adler32Fn {
     let mut best = None;
     available(&mut |(_, f)| {
         best.get_or_insert(f);

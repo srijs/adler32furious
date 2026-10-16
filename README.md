@@ -35,7 +35,7 @@ Throughput in GiB/s on 1 MiB of data:
 | Intel Sapphire Rapids | AVX-512 VNNI, 512-bit | **100.9** | 41.0 | 9.6 |
 | AMD Zen 4 | AVX-512 VNNI, 512-bit | **83.8** | 50.0 | 10.8 |
 | Intel Ice Lake | AVX-512 VNNI, 256-bit | **64.9** | 29.6 | 8.7 |
-| Apple M4 | NEON with dot product | **60.5** | 40.7 | 5.9 |
+| Apple M4 | NEON with dot product | **66.7** | 42.0 | 7.2 |
 | AMD Zen 3 | AVX2 | **51.0** | 45.7 | 10.0 |
 
 On these CPUs that is 1.1× (Zen 3, where both crates use AVX2) to 2.5×
@@ -45,13 +45,15 @@ By input size, on an Apple M4:
 
 | Crate | 16 B | 64 B | 1 KiB | 16 KiB | 1 MiB |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **adler32furious** | **3.8** | 18.3 | **59.3** | **64.1** | **60.5** |
-| [simd-adler32] | 2.4 | 18.4 | 40.2 | 39.9 | 40.7 |
-| [adler2] | 3.0 | 4.7 | 7.1 | 7.0 | 5.9 |
+| **adler32furious** | **6.2** | 18.6 | **60.5** | **66.4** | **66.7** |
+| [simd-adler32] | 2.4 | **19.8** | 42.1 | 42.1 | 42.0 |
+| [adler2] | 3.3 | 6.5 | 7.5 | 7.2 | 7.2 |
 
-The lead appears once inputs reach a few hundred bytes. On very short
-inputs, choosing an implementation and handling the leftover bytes takes
-most of the time, and all three are close.
+Inputs that are not a multiple of the vector size are fast too. From 16
+bytes on, the last partial vector is loaded so that it ends where the input
+does, with the bytes already summed masked off, so a 63-byte input costs
+about the same as a 64-byte one. The AVX-512 versions use masked loads for
+any length.
 
 The portable version is used on CPUs without a SIMD version. It processes a
 machine word at a time, treating it as several 16-bit lanes, and runs at
@@ -78,10 +80,9 @@ The fastest implementation the CPU supports is used:
 512-bit vectors are not used on Intel CPUs that slow down too much when they
 run them. AVX-512 is never used on macOS.
 
-The cost of choosing is small. std caches its CPU feature detection, so each
-call checks a cached value, and the implementation is called directly when
-the target features enabled at compile time already decide it. One example
-is dot product on Apple targets.
+Choosing costs at most one load of a cached value per call. When the target
+features enabled at compile time already decide it, as with dot product on
+Apple targets, the implementation is called directly.
 
 Every implementation is tested against a reference C implementation and
 fuzzed. In CI, every x86 implementation runs under Intel's SDE emulator.

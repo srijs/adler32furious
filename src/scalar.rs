@@ -1,4 +1,5 @@
-//! Portable Adler-32, also used for the tails of the vectorized versions.
+//! Portable Adler-32, also used by the vectorized versions for inputs under
+//! 16 bytes and to align large ones.
 //!
 //! Treats a machine word as a vector of 16-bit lanes ("SWAR"): each word of
 //! input is split into its even and odd bytes, which are summed per byte
