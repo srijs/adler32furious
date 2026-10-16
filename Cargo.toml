@@ -1,6 +1,6 @@
 [package]
 name = "adler32furious"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast Adler-32 checksums with SIMD for x86 and AArch64"
 edition = "2024"
 # The AVX-512 and AVX-VNNI intrinsics were stabilized in 1.89.
