@@ -81,12 +81,34 @@ jobs:
       - name: Set up SDE
         if: matrix.sde
         uses: petarpetrovt/setup-sde@v6.0
-      - name: Run tests under SDE
+      # The tests run on the libraries of libc6-amd64-cross, never the
+      # runner's own. The runner image installs Ubuntu's amd64v3 packages,
+      # whose glibc assumes AVX2, so under a CPU without it (Nehalem) the
+      # loader dies before a test starts. The cross packages are built for
+      # the x86-64 baseline. SDE has no sysroot option like QEMU's `-L`, so
+      # it starts the cross loader, and `--library-path` makes that search
+      # the cross libraries before the host's ld.so.cache.
+      - name: Run tests under SDE, on baseline libraries
         if: matrix.sde
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libc6-amd64-cross libgcc-s1-amd64-cross
+          sysroot=/usr/x86_64-linux-gnu
+          loader="$sysroot/lib64/ld-linux-x86-64.so.2 --library-path $sysroot/lib"
           sde=$(find "$SDE_PATH" -name sde64 -type f | head -n 1)
           test -x "$sde"
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$sde -${{ matrix.sde }} --" >> "$GITHUB_ENV"
+          run="$sde -${{ matrix.sde }} -- $loader"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$run" >> "$GITHUB_ENV"
+
+          # Fail if any library would still come from the host.
+          bin=$(cargo test --release --target "$TARGET" --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' | head -n 1)
+          libs=$($run --list "$bin")
+          echo "$libs"
+          if echo "$libs" | awk '$2 == "=>" { print $3 }' | grep -v "^$sysroot/"; then
+            echo "::error::libraries above resolve outside $sysroot"
+            exit 1
+          fi
       - name: Set up QEMU and the cross toolchain
         if: matrix.target == 's390x-unknown-linux-gnu'
         run: |
