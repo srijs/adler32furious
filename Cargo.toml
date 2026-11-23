@@ -1,6 +1,6 @@
 [package]
 name = "adler32furious"
-version = "0.1.1"
+version = "0.1.2"
 description = "Fast Adler-32 checksums with SIMD for x86 and AArch64"
 # 2021, not 2024: crates with an older MSRV (flate2 is on 1.67) depend on this
 # one optionally, and Cargo parses optional dependencies' manifests even when
