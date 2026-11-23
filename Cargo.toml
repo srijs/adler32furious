@@ -2,14 +2,17 @@
 name = "adler32furious"
 version = "0.1.1"
 description = "Fast Adler-32 checksums with SIMD for x86 and AArch64"
-edition = "2024"
+# 2021, not 2024: crates with an older MSRV (flate2 is on 1.67) depend on this
+# one optionally, and Cargo parses optional dependencies' manifests even when
+# they are not built. Cargo before 1.85 cannot parse edition 2024.
+edition = "2021"
 # The AVX-512 and AVX-VNNI intrinsics were stabilized in 1.89.
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/srijs/adler32furious"
 categories = ["algorithms", "compression", "no-std"]
 keywords = ["adler32", "checksum", "zlib", "simd"]
-exclude = ["/.github", "/bench", "/fuzz"]
+exclude = ["/.cargo", "/.github", "/bench", "/fuzz"]
 
 [features]
 default = ["std"]

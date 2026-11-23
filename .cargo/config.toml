@@ -1,0 +1,3 @@
+# Pick dependency versions that support our rust-version, as resolver 3 would.
+[resolver]
+incompatible-rust-versions = "fallback"
