@@ -87,12 +87,16 @@ jobs:
       # loader dies before a test starts. The cross packages are built for
       # the x86-64 baseline. SDE has no sysroot option like QEMU's `-L`, so
       # it starts the cross loader, and `--library-path` makes that search
-      # the cross libraries before the host's ld.so.cache.
+      # the cross libraries before the host's ld.so.cache. The amd64v3 gcc
+      # also emits AVX by default, so libdeflate (a C test dependency) is
+      # built for the baseline too.
       - name: Run tests under SDE, on baseline libraries
         if: matrix.sde
         run: |
           sudo apt-get update
           sudo apt-get install -y libc6-amd64-cross libgcc-s1-amd64-cross
+          export CFLAGS_x86_64_unknown_linux_gnu=-march=x86-64
+          echo "CFLAGS_x86_64_unknown_linux_gnu=$CFLAGS_x86_64_unknown_linux_gnu" >> "$GITHUB_ENV"
           sysroot=/usr/x86_64-linux-gnu
           loader="$sysroot/lib64/ld-linux-x86-64.so.2 --library-path $sysroot/lib"
           sde=$(find "$SDE_PATH" -name sde64 -type f | head -n 1)
