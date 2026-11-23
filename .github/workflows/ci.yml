@@ -213,13 +213,15 @@ jobs:
             riscv64gc-unknown-linux-gnu, powerpc64-unknown-linux-gnu,
             wasm32-unknown-unknown, x86_64-fortanix-unknown-sgx,
             thumbv6m-none-eabi, thumbv7em-none-eabi,
-            aarch64-unknown-none, x86_64-unknown-none
+            aarch64-unknown-none, x86_64-unknown-none,
+            x86_64-unknown-uefi, i686-unknown-uefi
       - uses: Swatinem/rust-cache@v2
       - name: With std
         run: |
           for target in aarch64-unknown-linux-gnu i586-unknown-linux-gnu i686-unknown-linux-gnu \
               riscv64gc-unknown-linux-gnu powerpc64-unknown-linux-gnu \
-              wasm32-unknown-unknown x86_64-fortanix-unknown-sgx; do
+              wasm32-unknown-unknown x86_64-fortanix-unknown-sgx \
+              x86_64-unknown-uefi i686-unknown-uefi; do
             echo "::group::$target"
             cargo clippy --lib --target "$target"
             cargo clippy --lib --target "$target" --no-default-features
@@ -232,8 +234,9 @@ jobs:
             cargo clippy --lib --target "$target" --no-default-features
             echo "::endgroup::"
           done
+      # Not x86_64-unknown-none: its soft-float ABI cannot enable SSE.
       - name: Without std, with AVX-512 (picked at runtime, with cached cpuid)
-        run: cargo clippy --lib --target x86_64-unknown-none --no-default-features
+        run: cargo clippy --lib --target x86_64-unknown-linux-gnu --no-default-features
         env:
           RUSTFLAGS: -D warnings -C target-feature=+avx512bw,+avx512vl,+avx512vnni
 

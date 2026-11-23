@@ -12,7 +12,8 @@
 //! Features enabled at compile time, such as dot product on Apple targets,
 //! need no runtime check at all.
 //!
-//! Under Miri, only the portable implementation is used.
+//! Under Miri, and on the soft-float x86 targets (`x86_64-unknown-none` and
+//! the UEFI targets), only the portable implementation is used.
 //!
 //! ```
 //! use adler32furious::{adler32, Adler32};
@@ -36,7 +37,14 @@ extern crate std;
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod arm;
 mod scalar;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// Not on the soft-float targets, where Rust refuses to enable SSE in a
+// function (rust-lang/rust#117938): x86_64's lack SSE2, which every other
+// x86_64 target has, and 32-bit x86's only one is `i686-unknown-uefi`, which
+// otherwise looks like i586 (no SSE2 baseline, SSE2 detected at run time).
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "sse2"),
+    all(target_arch = "x86", not(target_os = "uefi"))
+))]
 mod x86;
 
 const DIVISOR: u32 = 65521;
@@ -231,7 +239,10 @@ pub fn implementations() -> impl Iterator<Item = Implementation> {
 fn available(push: &mut impl FnMut((&'static str, Adler32Fn))) {
     // Miri cannot run SIMD code (the dot-product version uses inline asm).
     if !cfg!(miri) {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(any(
+            all(target_arch = "x86_64", target_feature = "sse2"),
+            all(target_arch = "x86", not(target_os = "uefi"))
+        ))]
         x86::available(push);
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         arm::available(push);
